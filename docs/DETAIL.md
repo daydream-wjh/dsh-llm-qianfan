@@ -127,6 +127,55 @@ parameter check failed, reasoning_effort must be none or low or medium or high o
 | ernie-5.5-flash-preview | low, medium, high | high |
 | ernie-light-dt-1.0 | low, high, max | max |
 
+
+## 对齐 DSH 官方 seam 契约（0.2.0，参照 dsh-opencode-go）
+
+初版是 duck-typed 最小实现，把自家路由跑通了，但漏掉了几件事——它们不是锦上添花，是 seam 契约里写明或影响运行行为的：
+
+| 项 | 初版 | 现在 | 为什么重要 |
+|---|---|---|---|
+| **归属头部** | 硬编码 UA 字符串 | `attributionHeaders()`，每次请求读 `DSH_USER_AGENT_SUFFIX` | 契约原话：「Every provider HTTP request must include `attributionHeaders()`」。硬编码会覆盖白标启动器的身份 |
+| **错误分类** | 抛裸 `Error` | `seamError()` 产出 `code`/`failure`/`status`/`providerRetryAfterMs` | 裸 Error 没有 code，429 既不会被重试也不会显示成限流；401 也不会被识别为鉴权失败 |
+| **重试策略** | `return undefined`（用宿主默认） | 显式策略，`maxDelayMs` 提到 60s | 千帆会因突发流量返回 `429 + Retry-After`（几十秒），宿主默认 10s 上限会把服务端建议丢掉 |
+| **模型发现** | 无 | `registerModelDiscovery` + 5 分钟缓存 | 静态目录会随模型上下线失真；发现接口让配置界面拿到网关当前真正接受的 id |
+| **输出上限** | 一个全局 `32768` | 按模型自己的 ceiling，超限前先夹 | ERNIE-5.5 允许 1M、GLM-5.x 只给 128k，用统一值会削掉大模型的额度 |
+| **空响应** | 静默产出空消息 | 分类后抛错 | 空消息会让这一轮无声结束，用户和 agent 循环都拿不到东西 |
+
+### 空响应的两种成因必须分开
+
+实测同一条请求（`max_tokens: 50`）：
+
+```
+第1次: finish=stop    content="OK"                reasoning=35 tok
+第2次: finish=stop    content="OK！..."            reasoning=37 tok
+第3次: finish=length  content=""                  reasoning=50 tok   ← 额度被思考吃光
+```
+
+第 3 次是真实的空响应，但成因是**额度不够**，不是模型退化。所以：
+
+- `finish=length` → 报 `CONTEXT_WINDOW_EXCEEDED`，**不重试**（重试只会再烧一次同样的 token），消息里点名「30 token 的额度被思考吃光，请提高 maxTokens 或降低 reasoningEffort」。
+- 其他情况 → 报 `EMPTY_RESPONSE`，**可重试**（退化完成，重发安全）。
+
+如果把两者都标成可重试，一次额度不足会变成 5 次无谓重试。
+
+### 发现接口的返回值取自两处
+
+套餐 `/models` 只给 `id`/`object`/`owned_by`，没有尺寸信息，所以发现结果按 id 去静态目录里补 `contextWindow`/`maxTokens`/模态：
+
+- 目录里有的模型 → 拿到完整元数据
+- 目录里没有的（如 `unlimited-ocr-2`）→ 只给 id，留给后续补录
+
+实测发现 12 个模型，其中 `unlimited-ocr-2` 是静态目录未收录的，正好体现动态发现的价值。
+
+### 安全边界
+
+发现请求只在**两种**情况下使用已保存的 key：
+
+1. 请求自带 `apiKey`（一次性凭据）
+2. `request.provider === 'qianfan'`（问的就是我们自己的路由）
+
+对一个陌生 `baseURL` 做发现时不会发送已存的付费 key——避免把凭据送给第三方端点。
+
 ## 已知限制
 
 - DeepSeek 系列不支持 `temperature`、`top_p`、`presence_penalty`、`frequency_penalty`、`logprobs`、`top_logprobs`，设了不报错但不生效

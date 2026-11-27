@@ -1,8 +1,8 @@
 {
   "name": "dsh-llm-qianfan",
-  "version": "1.0.1",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Baidu Qianfan Token Plan provider route for the DeepSeek Harness LLM seam: adds a qianfan model route with streaming text, reasoning, tool calls and per-model reasoning-effort ladders.",
+  "description": "Baidu Qianfan Token Plan provider route for the DeepSeek Harness LLM seam: streaming text, reasoning, tool calls, token usage, live model discovery and per-model reasoning-effort ladders.",
   "license": "MIT",
   "exports": {
     ".": "./index.js",

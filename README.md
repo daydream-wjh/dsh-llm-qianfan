@@ -103,6 +103,21 @@ To make it the default model, edit the profile's `cordis.patch.yml`:
     reasoningEffort: high   # DeepSeek's documented default
 ```
 
+## Seam contract
+
+The adapter is duck-typed, but it honours the same seam contract as the first-party and `dsh-opencode-go` routes:
+
+- **Attribution** — every wire request carries `user-agent: deepseek-harness/<version> (+url)`, with `DSH_USER_AGENT_SUFFIX` read per request so a white-label launcher is not overwritten.
+- **Typed failures** — errors carry a stable `code` from the harness taxonomy (`AUTH`, `RATE_LIMIT`, `SERVER`, `TRANSPORT`, `EMPTY_RESPONSE`, `CONTEXT_WINDOW_EXCEEDED`, …), plus `status` and `providerRetryAfterMs` when the provider supplied them.
+- **Retry policy** — a provider-owned policy with a 60 s `maxDelayMs`, so Qianfan's `429` + `Retry-After` is honoured instead of being discarded by the 10 s host default.
+- **Live discovery** — `registerModelDiscovery` answers from the gateway listing (5-minute cache) enriched with the static catalog, so the settings surface offers the ids the gateway accepts right now. `unlimited-ocr-2` is discovered but not in the static catalog, which is exactly the case discovery exists for.
+- **Per-model output allowance** — each model keeps its own ceiling (1,048,576 for ERNIE-5.5-Flash, 131,072 for GLM-5.x), with the route defaulting to 32,768 only when a caller states none.
+- **Degenerate replies** — an empty completion is reported rather than silently yielding an empty assistant message. A `length` finish is `CONTEXT_WINDOW_EXCEEDED` and is *not* retried, because repeating it would burn the same allowance again; any other empty completion is retryable `EMPTY_RESPONSE`.
+
+Two empty-completion causes are deliberately separated. Measured on one request with `max_tokens: 50`: two attempts returned content, a third returned `finish=length` with empty content and 50 reasoning tokens. That is an allowance problem the caller can fix, not a transport flake.
+
+Discovery sends the stored key only when the request carries its own `apiKey`, or when it asks about this provider's own route — a foreign `baseURL` never receives a paid credential.
+
 ## Known limits
 
 - Reasoning tokens are billed against `max_tokens`, so a small cap can be consumed entirely by thinking and return empty visible text. The plugin materializes `32768` when a caller omits `maxTokens`.

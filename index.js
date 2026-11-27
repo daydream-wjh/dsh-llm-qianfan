@@ -12,6 +12,13 @@
  * (`token_plan_person_api_key_not_allowed`) and vice versa, so the base URL and
  * the credential must always travel together.
  *
+ * The adapter is duck-typed rather than extending `LlmAdapter`, but it honours
+ * the same seam contract that the first-party and `dsh-opencode-go` routes do:
+ * attribution headers on every wire request, typed `LlmError` codes so retry
+ * policy and the UI can classify failures, a provider retry policy, live model
+ * discovery through `registerModelDiscovery`, and a per-model output allowance
+ * rather than one global cap.
+ *
  * @module dsh-llm-qianfan
  */
 
@@ -30,6 +37,61 @@ const DISPLAY_NAME = 'Qianfan Token Plan'
 const CREDENTIAL_REF = 'QIANFAN_API_KEY'
 const DEFAULT_BASE_URL = 'https://qianfan.baidubce.com/v2/tokenplan/personal'
 const DEFAULT_MODEL = 'deepseek-v4.1-flash'
+
+/**
+ * Attribution header value sent on every wire request.
+ *
+ * The seam contract requires adapters to identify themselves, and the launching
+ * application may append its own suffix through `DSH_USER_AGENT_SUFFIX`. This
+ * route reads that variable on each request instead of hard-coding one string,
+ * so a white-label launcher is not silently overwritten. A value that is not an
+ * RFC 9110 product token is rejected by the harness at launch, so no validation
+ * is repeated here.
+ */
+function attributionHeaders() {
+  const suffix = process.env.DSH_USER_AGENT_SUFFIX
+  const base = 'deepseek-harness (+https://github.com/deepseek-ai/deepseek-harness)'
+  return { 'user-agent': suffix === undefined || suffix === '' ? base : `${base} ${suffix}` }
+}
+
+/**
+ * Cap one request's output allowance.
+ *
+ * Qianfan bills reasoning tokens against the same cap as visible text, and the
+ * gateway rejects anything above 393216 on this gateway's models. A caller that
+ * states no allowance gets the smaller of the model's advertised ceiling and
+ * this route's default, so an unopinionated call cannot spend the whole context
+ * on one reply.
+ */
+const DEFAULT_OUTPUT_ALLOWANCE = 32768
+
+/**
+ * Fallback ceiling for a model the static catalog does not describe.
+ *
+ * Not a shared ceiling: models on this gateway disagree (393216 for DeepSeek,
+ * 131072 for GLM-5.x, 1048576 for ERNIE-5.5-Flash). Each catalog entry carries
+ * its own limit; this constant only covers a model discovered from the live
+ * listing but not yet added to the catalog.
+ */
+const GATEWAY_MAX_OUTPUT = 393216
+
+/**
+ * Provider retry policy mirroring the harness defaults, but with a longer
+ * ceiling: Qianfan's scheduler pauses bursts and answers `429` with a
+ * `Retry-After` measured in tens of seconds, which the 10s host default would
+ * discard in favour of the local backoff.
+ */
+const RETRY_POLICY = Object.freeze({
+  mode: 'normal',
+  maxRetries: 5,
+  retryableCodes: Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']),
+  initialDelayMs: 500,
+  maxDelayMs: 60_000,
+  jitterRatio: 0.1,
+})
+
+/** How long one discovery reply is trusted before the endpoint is asked again. */
+const DISCOVERY_TTL_MS = 5 * 60 * 1000
 
 /**
  * Reasoning-effort ladders, one per model family, taken verbatim from each
@@ -306,7 +368,8 @@ function buildBody(options, config) {
       }))
     if (body.tools.length === 0) delete body.tools
   }
-  if (typeof options.maxTokens === 'number' && options.maxTokens > 0) body.max_tokens = options.maxTokens
+  const allowance = outputAllowanceOf(options.model, options.maxTokens)
+  if (allowance !== undefined) body.max_tokens = allowance
   if (typeof options.temperature === 'number') body.temperature = options.temperature
   if (Array.isArray(options.stop) && options.stop.length > 0) body.stop = options.stop
   // `reasoning_effort` and `thinking` are independent axes on Qianfan:
@@ -333,6 +396,187 @@ function finishOf(reason, sawToolCall) {
 }
 
 /**
+ * Live model directory, as last read from the gateway.
+ *
+ * The Token Plan `/models` endpoint returns only `id`/`object`/`owned_by`, so it
+ * cannot replace the static catalog for sizing or effort ladders. It can still
+ * answer the one question the static catalog gets wrong over time: which ids the
+ * gateway accepts right now. A model that has been retired therefore disappears
+ * from discovery, and a newly launched one appears without a plugin release.
+ */
+function createDiscovery(configOf) {
+  let cached = null
+  let cachedAt = 0
+
+  /** Read the gateway listing, tolerating the terse Token Plan shape. */
+  async function readListing(baseURL, apiKey, signal) {
+    const response = await fetch(endpointOf(baseURL, '/models'), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        ...attributionHeaders(),
+      },
+      ...signal === undefined ? {} : { signal },
+    })
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      throw new Error(`HTTP ${response.status}${detail === '' ? '' : `: ${detail.slice(0, 300)}`}`)
+    }
+    const body = await response.json()
+    const rows = Array.isArray(body?.data) ? body.data : []
+    const ids = []
+    for (const row of rows) {
+      const id = typeof row?.id === 'string' ? row.id.trim() : ''
+      if (id !== '' && !ids.includes(id)) ids.push(id)
+    }
+    if (ids.length === 0) throw new Error('the listing carried no model ids')
+    return ids
+  }
+
+  return {
+    /**
+     * Answer one discovery request.
+     *
+     * A route this adapter already owns answers from the static catalog plus the
+     * live listing, so the settings surface offers exactly what the gateway will
+     * accept. An endpoint the caller is drafting is interrogated directly with
+     * the one-shot credential the request carries.
+     * @param request - endpoint or route under interrogation.
+     * @param signal - caller cancellation.
+     * @returns advertised models in listing order, enriched from the catalog.
+     */
+    async discover(request, signal) {
+      const config = configOf()
+      const baseURL = typeof request.baseURL === 'string' && request.baseURL !== ''
+        ? request.baseURL
+        : typeof config.baseURL === 'string' && config.baseURL !== '' ? config.baseURL : DEFAULT_BASE_URL
+      // A draft may arrive before a credential is stored; ask the saved one only
+      // for our own route, so a foreign endpoint is never sent our paid key.
+      const apiKey = typeof request.apiKey === 'string' && request.apiKey !== ''
+        ? request.apiKey
+        : request.provider === PROVIDER ? resolveApiKey(config) : undefined
+      if (apiKey === undefined) {
+        throw new Error('model discovery needs a credential for this endpoint; enter one, or store QIANFAN_API_KEY')
+      }
+
+      const now = Date.now()
+      const reuse = cached !== null && now - cachedAt < DISCOVERY_TTL_MS
+      const ids = reuse && cached.baseURL === baseURL ? cached.ids : await readListing(baseURL, apiKey, signal)
+      cached = { baseURL, ids }
+      cachedAt = now
+
+      return ids.map((id) => {
+        const entry = CATALOG.find(candidate => candidate.id === id)
+        return {
+          id,
+          ...entry === undefined ? {} : { name: entry.name },
+          ...entry === undefined ? {} : { contextWindow: entry.contextWindow },
+          ...entry === undefined ? {} : { maxTokens: entry.maxTokens },
+          inputModalities: entry?.images === true ? ['text', 'image'] : ['text'],
+        }
+      })
+    },
+
+    /** Drop the cached listing so the next discovery asks again. */
+    invalidate() {
+      cached = null
+      cachedAt = 0
+    },
+  }
+}
+
+/**
+ * Classify one HTTP status into a seam failure code.
+ *
+ * An unclassified status becomes `HTTP_<n>`, which the retry policy can still
+ * name; the mapped codes are the ones the harness treats specially, and getting
+ * them wrong changes behaviour rather than wording — `RATE_LIMIT` is retried
+ * with the provider's own `Retry-After`, while `AUTH` is not retried at all.
+ * @param status - provider HTTP status.
+ * @returns the stable code for this status.
+ */
+function failureCodeOf(status) {
+  if (status === 401 || status === 403) return 'AUTH'
+  if (status === 408) return 'TIMEOUT'
+  if (status === 429) return 'RATE_LIMIT'
+  if (status >= 500) return 'SERVER'
+  return `HTTP_${status}`
+}
+
+/**
+ * Read a provider `Retry-After` header as milliseconds.
+ *
+ * Qianfan sends both the delta-seconds and the HTTP-date form. Anything
+ * unparsable is dropped rather than guessed, because a wrong long delay would
+ * stall the retry loop on a request that was never rate limited.
+ * @param headers - response headers.
+ * @returns the delay in milliseconds, or undefined when absent or invalid.
+ */
+function retryAfterMsOf(headers) {
+  const raw = headers.get('retry-after')
+  if (raw === null || raw.trim() === '') return undefined
+  const seconds = Number(raw.trim())
+  if (Number.isFinite(seconds) && seconds > 0) return Math.round(seconds * 1000)
+  const at = Date.parse(raw)
+  if (!Number.isNaN(at)) {
+    const delta = at - Date.now()
+    return delta > 0 ? delta : undefined
+  }
+  return undefined
+}
+
+/**
+ * Build a typed seam failure.
+ *
+ * The harness shares one error taxonomy across providers; a plain `Error` loses
+ * that classification, so a 429 would neither be retried nor shown as rate
+ * limiting. A duck-typed adapter cannot import `LlmError`, so the shape is
+ * reproduced: `code`, `failure`, `status`, `providerRetryAfterMs`.
+ * @param message - non-empty human-readable summary.
+ * @param code - stable seam failure code.
+ * @param extra - optional provider facts.
+ * @returns the error to throw.
+ */
+function seamError(message, code, extra = {}) {
+  const error = new Error(message)
+  error.name = 'LlmError'
+  error.code = code
+  error.failure = Object.freeze({
+    message,
+    code,
+    ...extra.status === undefined ? {} : { status: extra.status },
+    ...extra.providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs: extra.providerRetryAfterMs },
+    ...extra.requestId === undefined ? {} : { requestId: extra.requestId },
+  })
+  if (extra.status !== undefined) error.status = extra.status
+  if (extra.providerRetryAfterMs !== undefined) error.providerRetryAfterMs = extra.providerRetryAfterMs
+  return error
+}
+
+/**
+ * Clamp one request's output allowance.
+ *
+ * The caller's explicit value wins, because a caller that states a cap has a
+ * reason. The route only fills in a default when none was given, and never lets
+ * a value past that model's own ceiling — which would fail the whole request
+ * with `parameter check failed, max_tokens range is [1, <ceiling>]`.
+ * @param model - model id whose ceiling applies.
+ * @param requested - caller's allowance, when stated.
+ * @returns the allowance to send, or undefined to leave the field out.
+ */
+function outputAllowanceOf(model, requested) {
+  const entry = CATALOG.find(candidate => candidate.id === model)
+  // Each model publishes its own ceiling (ERNIE-5.5 allows 1M, GLM-5.x 128k);
+  // the gateway-wide constant is only the fallback for a model the catalog does
+  // not describe yet, because clamping every model to the smallest ceiling would
+  // silently rob the large ones of their allowance.
+  const ceiling = entry?.maxTokens ?? GATEWAY_MAX_OUTPUT
+  if (typeof requested === 'number' && requested > 0) return Math.min(requested, ceiling)
+  return Math.min(DEFAULT_OUTPUT_ALLOWANCE, ceiling)
+}
+
+/**
  * Build the adapter object registered for the `qianfan` route.
  * @param {() => object} configOf - reads the current row config.
  * @returns {object} an `LlmAdapter`-shaped object.
@@ -344,12 +588,16 @@ function createAdapter(configOf) {
     },
 
     /**
-     * The route declares no retry policy of its own; `undefined` keeps the
-     * harness defaults. The seam calls this method directly, so a duck-typed
-     * adapter must define it even when it has nothing to say.
+     * Provider-owned retry policy.
+     *
+     * Returning a policy rather than `undefined` matters for rate limiting:
+     * Qianfan pauses bursts and answers `429` with a `Retry-After` of tens of
+     * seconds, and the policy's longer `maxDelayMs` lets the retry plugin honour
+     * that instead of discarding it in favour of a local 10s backoff.
+     * @returns the resolved policy for this route.
      */
     providerRetryPolicy() {
-      return undefined
+      return RETRY_POLICY
     },
 
     /** No provider-side image pricing: this route declares text-only input. */
@@ -418,21 +666,35 @@ function createAdapter(configOf) {
             'Content-Type': 'application/json',
             Accept: 'text/event-stream',
             Authorization: `Bearer ${apiKey}`,
-            'User-Agent': 'deepseek-harness (+https://github.com/deepseek-ai/deepseek-harness)',
+            ...attributionHeaders(),
           },
           body: JSON.stringify(body),
           ...options.signal === undefined ? {} : { signal: options.signal },
         })
       } catch (error) {
+        // A caller cancellation is not a provider failure: end the stream
+        // quietly so the harness reports an abort rather than a transport error.
         if (options.signal?.aborted === true) return
-        throw error
+        throw seamError(`llm-qianfan: transport failed: ${error.message}`, 'TRANSPORT', { cause: error })
       }
 
       if (!response.ok) {
         const detail = await response.text().catch(() => '')
-        throw new Error(`llm-qianfan: provider returned HTTP ${response.status}${detail === '' ? '' : `: ${detail.slice(0, 500)}`}`)
+        const requestId = response.headers.get('x-request-id') ?? undefined
+        const retryAfter = retryAfterMsOf(response.headers)
+        throw seamError(
+          `llm-qianfan: provider returned HTTP ${response.status}${detail === '' ? '' : `: ${detail.slice(0, 500)}`}`,
+          failureCodeOf(response.status),
+          {
+            status: response.status,
+            ...retryAfter === undefined ? {} : { providerRetryAfterMs: retryAfter },
+            ...requestId === undefined || requestId === '' ? {} : { requestId },
+          },
+        )
       }
-      if (response.body === null) throw new Error('llm-qianfan: provider returned an empty body')
+      if (response.body === null) {
+        throw seamError('llm-qianfan: provider returned an empty body', 'MALFORMED_RESPONSE', { status: response.status })
+      }
 
       /** Accumulated emitted blocks, in emission order. */
       const blocks = []
@@ -593,6 +855,29 @@ function createAdapter(configOf) {
         }
       }
 
+      // A completion that produced neither visible text nor a tool call ends the
+      // turn with nothing for the user or the loop to act on. Two causes are
+      // distinct and must not be treated alike:
+      //
+      //  - `length`: the allowance was consumed entirely by reasoning. That is an
+      //    allowance problem the caller can fix, and retrying the same request
+      //    would only burn the same tokens again — so it is reported as
+      //    `EMPTY_RESPONSE` *without* being retryable, and the message names the
+      //    cap so the fix is obvious.
+      //  - anything else: a degenerate completion the provider still billed.
+      //    Repeating it is safe, so it carries the retryable code.
+      if (textBlock === null && toolBlocks.size === 0 && usage !== null) {
+        const reasoningSpent = Number(usage.completion_tokens_details?.reasoning_tokens ?? 0)
+        const cap = body.max_tokens ?? DEFAULT_OUTPUT_ALLOWANCE
+        throw seamError(
+          reasoningSpent > 0
+            ? `llm-qianfan: the ${cap}-token output allowance was spent entirely on reasoning`
+              + ` (${reasoningSpent} reasoning tokens); raise maxTokens or lower reasoningEffort`
+            : 'llm-qianfan: the provider returned no content blocks',
+          finishReason === 'length' ? 'CONTEXT_WINDOW_EXCEEDED' : 'EMPTY_RESPONSE',
+        )
+      }
+
       yield { type: 'finish', reason: finishOf(finishReason, sawToolCall) }
     },
   }
@@ -606,7 +891,10 @@ function createAdapter(configOf) {
 export function apply(ctx, config) {
   const rowConfig = config ?? {}
   const configOf = () => rowConfig
+  const discovery = createDiscovery(configOf)
   const adapter = createAdapter(configOf)
+  const settingsNs = ctx.fiber?.entry?.options?.id ?? name
+
   // Registration is fiber-scoped: the LLM seam releases the route when this
   // plugin row unloads, so no explicit disposer is needed here.
   ctx.llm.registerAdapter([PROVIDER], adapter)
@@ -615,11 +903,25 @@ export function apply(ctx, config) {
     {
       provider: PROVIDER,
       displayName: DISPLAY_NAME,
-      settingsNs: ctx.fiber?.entry?.options?.id ?? name,
+      settingsNs,
       settingsPath: [],
       defaultBaseURL: DEFAULT_BASE_URL,
     },
   ])
+
+  // Live model discovery, so the settings surface offers what the gateway
+  // accepts right now instead of the catalog frozen at release time. Registered
+  // defensively: an older host without the seam method, or one that already has
+  // a discovery for this namespace, must not take the provider route down with
+  // it — the static catalog still answers `listModels` either way.
+  if (typeof ctx.llm.registerModelDiscovery === 'function') {
+    try {
+      ctx.llm.registerModelDiscovery(settingsNs, (request, signal) => discovery.discover(request, signal))
+    } catch (error) {
+      ctx.logger?.warn?.(`llm-qianfan: not registering model discovery for "${settingsNs}": ${error.message}`)
+    }
+  }
+
   try {
     const key = resolveApiKey(rowConfig)
     ctx.logger?.info?.(`llm-qianfan: provider "${PROVIDER}" ready (default model ${DEFAULT_MODEL}, key ...${key.slice(-4)})`)

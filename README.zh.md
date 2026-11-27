@@ -102,6 +102,21 @@ QIANFAN_API_KEY: 'bce-v3/ALTAK...'
     reasoningEffort: high   # DeepSeek 文档给出的默认档
 ```
 
+## 对齐 seam 契约
+
+适配器是 duck-typed 的，但遵守与官方路由、`dsh-opencode-go` 相同的 seam 契约：
+
+- **归属头部** —— 每个请求带 `user-agent: deepseek-harness/<version> (+url)`，并逐次读取 `DSH_USER_AGENT_SUFFIX`，不覆盖白标启动器的身份。
+- **错误分类** —— 错误携带稳定的 `code`（`AUTH`、`RATE_LIMIT`、`SERVER`、`TRANSPORT`、`EMPTY_RESPONSE`、`CONTEXT_WINDOW_EXCEEDED` 等），以及提供方给出的 `status` 与 `providerRetryAfterMs`。
+- **重试策略** —— provider 自有策略，`maxDelayMs` 提到 60 秒，让千帆的 `429` + `Retry-After` 生效，而不是被宿主 10 秒默认值丢掉。
+- **动态发现** —— `registerModelDiscovery` 从网关列表作答（5 分钟缓存），并用静态目录补尺寸，配置界面因此拿到网关当前真正接受的 id。`unlimited-ocr-2` 就是被发现但静态目录未收录的例子。
+- **按模型的输出上限** —— 各模型保留自己的 ceiling（ERNIE-5.5-Flash 1,048,576、GLM-5.x 131,072），调用方不指定时路由才用 32,768。
+- **退化响应** —— 空完成会被报出，而不是静默产出一条空消息。`length` 结束归为 `CONTEXT_WINDOW_EXCEEDED` 且**不重试**，因为重发只会再烧一次同样的额度；其他空完成才归为可重试的 `EMPTY_RESPONSE`。
+
+两种空完成成因刻意分开。同一条 `max_tokens: 50` 的请求实测：两次有内容，第三次 `finish=length` 且内容为空、思考吃掉 50 token。那是调用方可以修的额度问题，不是传输抖动。
+
+发现只在请求自带 `apiKey`、或问的就是本路由时才发送已保存的 key——陌生 `baseURL` 拿不到付费凭据。
+
 ## 已知限制
 
 - 推理 token 计入 `max_tokens`，上限设太小会只剩思考、正文为空。调用方不传 `maxTokens` 时插件物化 `32768`。
