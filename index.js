@@ -25,6 +25,7 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { foldUsage, meterView, mountUsageRoutes } from './lib/usage-meter.js'
 
 /** Plugin row name surfaced in logs and the plugin inventory. */
 export const name = 'llm-qianfan'
@@ -579,9 +580,12 @@ function outputAllowanceOf(model, requested) {
 /**
  * Build the adapter object registered for the `qianfan` route.
  * @param {() => object} configOf - reads the current row config.
+ * @param {{ onUsage?: (usage: object) => void }} [hooks] - optional observation
+ *   hook: the usage readout folds each report into its own plan windows. It is
+ *   a side channel only — the adapter's emitted events are unchanged by it.
  * @returns {object} an `LlmAdapter`-shaped object.
  */
-function createAdapter(configOf) {
+function createAdapter(configOf, hooks = {}) {
   return {
     providerInfo(provider) {
       return { id: provider, name: DISPLAY_NAME }
@@ -843,16 +847,22 @@ function createAdapter(configOf) {
             ?? 0,
         )
         const inputTokens = Math.max(0, prompt - cacheRead)
-        yield {
-          type: 'usage',
-          usage: {
-            inputTokens,
-            outputTokens: completion,
-            totalTokens: Number(usage.total_tokens ?? prompt + completion),
-            ...reasoningTokens > 0 ? { reasoningTokens } : {},
-            ...cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
-          },
+        const reported = {
+          inputTokens,
+          outputTokens: completion,
+          totalTokens: Number(usage.total_tokens ?? prompt + completion),
+          ...reasoningTokens > 0 ? { reasoningTokens } : {},
+          ...cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
         }
+        // Observed before it is yielded, so the readout's window total includes
+        // the request the user is watching. A throwing hook must not break the
+        // stream: the meter is diagnostics, the response is the product.
+        try {
+          hooks.onUsage?.(reported)
+        } catch {
+          // ignored on purpose — see above
+        }
+        yield { type: 'usage', usage: reported }
       }
 
       // A completion that produced neither visible text nor a tool call ends the
@@ -892,7 +902,17 @@ export function apply(ctx, config) {
   const rowConfig = config ?? {}
   const configOf = () => rowConfig
   const discovery = createDiscovery(configOf)
-  const adapter = createAdapter(configOf)
+
+  // The local half of the usage readout: every `usage` event the adapter yields
+  // is folded into the plan's own windows, so the card can report what this
+  // machine spent even when no console Cookie is configured. Holds only the
+  // last month of samples, so it never grows with the process.
+  let meterState = null
+  const onUsage = (usage) => {
+    meterState = foldUsage(meterState, usage, Date.now())
+  }
+
+  const adapter = createAdapter(configOf, { onUsage })
   const settingsNs = ctx.fiber?.entry?.options?.id ?? name
 
   // Registration is fiber-scoped: the LLM seam releases the route when this
@@ -909,8 +929,47 @@ export function apply(ctx, config) {
     },
   ])
 
+  // The usage card needs a Web server to answer from. A headless profile has
+  // none, and the provider route must keep working there: the whole feature is
+  // mounted inside an optional scope instead of in `inject`, so this plugin
+  // stays active either way. `connection` is declared here because the routes
+  // read its gate — reading a service from a context that never declared it
+  // throws, and the routes would then answer 403 to every browser.
+  if (typeof ctx.inject === 'function') {
+    try {
+      // `webServer` and `connection` gate the routes; `credentials` is nested
+      // one level deeper because it is optional: a profile without a credential
+      // store must still serve the readout (the local meter needs no store), it
+      // only has to refuse the Cookie write with an explanation.
+      ctx.inject(['webServer', 'connection'], (scope) => {
+        const store = { value: undefined }
+        try {
+          scope.inject(['credentials'], (storeScope) => {
+            store.value = storeScope.get('credentials')
+            return () => {
+              if (store.value === storeScope.get('credentials')) store.value = undefined
+            }
+          })
+        } catch {
+          // No credential service in this profile: the write path reports it.
+        }
+        try {
+          mountUsageRoutes(scope, {
+            configOf,
+            meterOf: () => meterState,
+            // Read from whichever scope declared it: a cross-context read throws.
+            credentialsOf: () => store.value,
+          })
+        } catch (error) {
+          ctx.logger?.warn?.(`llm-qianfan: usage readout not mounted: ${error.message}`)
+        }
+      })
+    } catch (error) {
+      ctx.logger?.warn?.(`llm-qianfan: usage readout scope failed: ${error.message}`)
+    }
+  }
+
   // Live model discovery, so the settings surface offers what the gateway
-  // accepts right now instead of the catalog frozen at release time. Registered
   // defensively: an older host without the seam method, or one that already has
   // a discovery for this namespace, must not take the provider route down with
   // it — the static catalog still answers `listModels` either way.

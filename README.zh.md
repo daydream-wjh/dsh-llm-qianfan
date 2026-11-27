@@ -117,6 +117,67 @@ QIANFAN_API_KEY: 'bce-v3/ALTAK...'
 
 发现只在请求自带 `apiKey`、或问的就是本路由时才发送已保存的 key——陌生 `baseURL` 拿不到付费凭据。
 
+## 用量看板
+
+composer 上方有一条额度行，展开是两组数字。**它们来源不同，不能互相替代**。
+
+### 套餐额度（官方口径，需要控制台 Cookie）
+
+只有百度智能云控制台能回答「套餐还剩多少」：
+
+```
+GET https://console.bce.baidu.com/api/qianfan/charge/tokenPlanPersonal/resource
+```
+
+**推理 API Key 查不了额度**——这跟插件实现无关，是服务端没有这条路：key 打这个接口一律 302 到登录页，而 `/v2/tokenplan/personal/{usage,quota,plan,balance,credits,…}` 逐一实测全 404。控制台接口认的是 console.bce.baidu.com 的登录 Cookie。
+
+### 自动刷新（launchd）
+
+Cookie 是浏览器会话，会过期。已经装了一个每天 04:17 跑的 launchd 任务，顺带在登录时跑一次：
+
+```sh
+tools/qianfan-cookie-install.sh   # 安装/更新任务（改完脚本后重跑）
+launchctl kickstart -k gui/$(id -u)/io.dsh.qianfan-cookie   # 手动触发一次
+tail /tmp/dsh-qianfan-refresh.out.log                       # 看结果
+```
+
+两条安全性质：**写前必验**（过期的浏览器会话不会覆盖可用的凭据）、**值没变就不写**（健康的一天不动文件，凭据库不会因此重载）。
+
+它在 `~/.dsh/tools/` 下运行，不在仓库目录里——macOS 的 TCC 不允许后台代理读 `~/Documents`，任务读不到自己的脚本会以 126 退出。仓库里的那份是源，`install.sh` 负责同步过去。
+
+在设置页「千帆 Token Plan」里粘 Cookie，**用 Copy as cURL**：登录控制台并打开「我的订阅」→ F12 打开「网络」→ 刷新 → 找到 `tokenPlanPersonal/resource` 请求 → 右键「Copy as cURL」→ 把整段命令粘进来。
+
+为什么不能直接复制 Cookie 值：登录票 `BDUSS` 是 **HttpOnly** 的，`document.cookie`（实测该域返回 34 个 Cookie，其中没有 `BDUSS`）、开发者工具「应用」面板的值单元格、以及任何页面脚本能看到的请求头都不含它。实测把这一整套非 HttpOnly Cookie 发给额度接口，仍然是 `302` 跳登录页。`Copy as cURL` 是浏览器里唯一会带上它的动作，所以插件直接接受整段命令并从中抽取 `Cookie` 头。
+
+### 自动提取（macOS，需一次权限授予）
+
+Cookie 是浏览器会话，会过期。除了在设置页粘 Copy as cURL，也可以让脚本从 Chrome 本地加密库直接取：
+
+```sh
+tools/qianfan-refresh.sh            # 提取、验证、写入凭据库
+tools/qianfan-refresh.sh --dry-run  # 只验证，不写
+```
+
+macOS 会把 Chrome 的 Cookie 库挡在**完全磁盘访问权限**后面：未授权时 `cp`、Finder 代抄、在 Terminal.app 内执行 `cp` 全部 `Operation not permitted`；授权后一次跑通。授权方式：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 勾上运行 DSH 的 app，重启 DSH。
+
+脚本写之前一定先探真实接口，所以过期时随时重跑都安全——不会把能用的凭据换成坏的。也可以挂 cron 让它定期刷新。
+
+存在凭据库的 `BAIDU_QIANFAN_COOKIE`，也可以直接用这个环境变量。存之前会先探一次：登录过期、或少了 `BDUSS`，都不写——否则会得到一个显示「已配置」却永远失败的凭据。
+
+### 本机计量（这台机器实际计费的 token）
+
+适配器每发一次 `usage`，宿主就折进套餐自己的窗口：5 小时 / 本周 / 本月。按 Token 制口径算，输入+输出+缓存全部计入（千帆 Token 制不区分缓存）。
+
+它的价值是兜底：没有 Cookie 时它是唯一能看的数字；有 Cookie 时它告诉你订阅里有多少是本机花的。但它**不等于**官方已用量——控制台统计所有客户端。
+
+| 状态 | 卡片 |
+| --- | --- |
+| 没有 Cookie | 写「未配置控制台 Cookie」，本机计量照常显示 |
+| Cookie 过期 | 写登录过期，本机计量照常显示 |
+| 无有效套餐 | 不把过期套餐的 100% 读成「用光了」 |
+
+官方半边的失败不拖垮本机半边：额度行不消失、不显示假的 0%。
+
 ## 已知限制
 
 - 推理 token 计入 `max_tokens`，上限设太小会只剩思考、正文为空。调用方不传 `maxTokens` 时插件物化 `32768`。
@@ -129,7 +190,10 @@ QIANFAN_API_KEY: 'bce-v3/ALTAK...'
 
 ```sh
 node --input-type=module -e "await import('./index.js')"   # 语法检查
+npm test                                                   # 57 项离线验证
 ```
+
+`verify/` 四个套件：`usage-meter.test.mjs`（Cookie 形状、时区、两种计费模式、窗口算术）、`route.test.mjs`（路由契约与门禁）、`client.test.mjs`（渲染状态）、`apply.test.mjs`（`apply()` 是否真的挂上路由，以及一次真实流式响应是否进得了计量）。
 
 ## 许可
 

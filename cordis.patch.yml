@@ -12,3 +12,17 @@
       config:
         apiKey: ''
         baseURL: 'https://qianfan.baidubce.com/v2/tokenplan/personal'
+
+# Usage readout (0.3.0). Two optional keys, both empty by default:
+#
+#   cookie          console.bce.baidu.com session Cookie for the quota readout.
+#                   Leave it empty to use the stored credential
+#                   BAIDU_QIANFAN_COOKIE or the environment variable of the
+#                   same name. This is NOT the inference key: Baidu publishes no
+#                   key-authenticated quota endpoint, so the API key above
+#                   cannot answer the plan's remaining balance.
+#   credentialsFile the credentials document to read both from, when it is not
+#                   $DSH_HOME/.credentials.yaml.
+#
+# The feature mounts inside an optional webServer scope, so a headless profile
+# keeps the provider route and simply has no card.

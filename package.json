@@ -1,16 +1,18 @@
 {
   "name": "dsh-llm-qianfan",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Baidu Qianfan Token Plan provider route for the DeepSeek Harness LLM seam: streaming text, reasoning, tool calls, token usage, live model discovery and per-model reasoning-effort ladders.",
+  "description": "Baidu Qianfan Token Plan provider route for the DeepSeek Harness LLM seam: streaming text, reasoning, tool calls, token usage, live model discovery, per-model reasoning-effort ladders, and a Token Plan usage readout (console quota + local meter) above the composer.",
   "license": "MIT",
   "exports": {
     ".": "./index.js",
+    "./client": "./lib/client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "lib",
     "cordis.patch.yml",
     "locale/*.json",
     "docs",
@@ -19,9 +21,15 @@
     "README.zh.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test verify/usage-meter.test.mjs verify/route.test.mjs verify/client.test.mjs verify/apply.test.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "keywords": [

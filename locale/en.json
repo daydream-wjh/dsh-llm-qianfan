@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Qianfan Token Plan provider",
-    "description": "Adds a qianfan model route backed by Baidu Qianfan's Token Plan OpenAI-compatible gateway, with streaming text, reasoning, tool calls, and token usage.",
+    "description": "Baidu Qianfan Token Plan provider route for the DeepSeek Harness LLM seam: streaming text, deep reasoning, tool calls and usage accounting, plus a Token Plan readout above the composer showing the console's quota and this machine's meter.",
     "detail": "docs/DETAIL.md"
   }
 }

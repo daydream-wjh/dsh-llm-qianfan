@@ -183,3 +183,115 @@ parameter check failed, reasoning_effort must be none or low or medium or high o
 - 推理 token 计入 `max_tokens`，上限设太小会只剩思考、正文为空（32 token 上限实测正文全空）
 - 千帆的 Anthropic 兼容通道在 `https://qianfan.baidubce.com/anthropic/tokenplan/personal`，本插件不走它
 - 模型清单是静态内置的，不调用 `/models` 自动发现
+
+## 用量看板：套餐额度 + 本机计量（0.3.0）
+
+composer 上方多一条额度行，展开后是两组数字。**这两组数字来源不同，不能互相替代**，所以并排显示、各自标注。
+
+### 第一组：套餐额度（官方口径）
+
+唯一权威来源是百度智能云**控制台**的订阅接口：
+
+```
+GET https://console.bce.baidu.com/api/qianfan/charge/tokenPlanPersonal/resource
+Cookie: <控制台登录 Cookie>
+X-Requested-With: XMLHttpRequest
+```
+
+返回 `{success, result: {items: [...]}}`，`billingMode: "credit"` 时读 `usedCredits`/`totalCredits`，`"token"` 时读 `usedTokens`/`totalTokens`；`expiresAt` 是套餐到期时间（控制台写的是不带时区的中国时间，插件按 `+08:00` 解析）。
+
+**为什么必须用 Cookie 而不是 API Key**：这是两个不同的凭据类。推理 key 打这个接口一律 302 到登录页；Baidu 也没有发布任何 key 鉴权的额度接口——`/v2/tokenplan/personal/{usage,quota,plan,balance,credits,…}` 逐一实测全 404，`chat/completions` 只回 token 计数、不含额度信封。所以「用 API Key 查套餐额度」这条路在服务端不存在，不是插件没实现。
+
+Cookie 存在凭据库的 `BAIDU_QIANFAN_COOKIE`，也可以走环境变量或插件配置的 `cookie` 字段。保存前会先探一次：探不通（登录过期）就不写；探得通才存，并把探测结果一并发回页面。
+
+### 为什么必须用 Copy as cURL，而不是复制 Cookie 值
+
+登录票 `BDUSS` 是 **HttpOnly** 的。实测该域 `document.cookie` 返回 34 个 Cookie，**其中没有 `BDUSS`**；把这一整套发给额度接口，仍然 `302` 跳登录页。开发者工具「应用」面板的值单元格同样看不到它，任何页面脚本能读到的请求头也不含它；请求捕获工具按设计把 `cookie` 显示为 `[redacted]`，也取不到。
+
+浏览器里唯一会带上它的动作是**在网络面板里右键请求 →「Copy as cURL」**。所以插件直接接受整段 cURL 命令（也接受 `-b` / `--cookie` 形态），从中抽出 `Cookie` 头。没有 `BDUSS` 的头部一律拒收，并在错误里指明应该改用 Copy as cURL——否则会存进一个「已配置」但永远失败的凭据。
+
+### 自动提取（需要一次权限授予）
+
+`tools/qianfan-cookie-extract.mjs` 是另一条路：Chrome 把 Cookie 加密存在本地，密钥在 macOS 钥匙串的 `Chrome Safe Storage` 项里，本地进程可以解密后直接写进凭据库。
+
+macOS 会把 Chrome 的 Cookie 库挡在**完全磁盘访问权限**后面。给权限前后都实测过：
+
+| 状态 | 结果 |
+|---|---|
+| 未授权 | `cp`、Finder 代抄、在 Terminal.app 内执行 `cp` 三种方式全部 `Operation not permitted` |
+| 授权后 | 一次跑通，`verify=ok`，写入 `refs.BAIDU_QIANFAN_COOKIE` |
+
+授权方式：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 加上运行这条命令的程序，重启 DSH。之后：
+
+```sh
+tools/qianfan-refresh.sh            # 重取并写入
+tools/qianfan-refresh.sh --dry-run  # 只验证，不写
+```
+
+**已装 launchd 定时任务**（`io.dsh.qianfan-cookie`，每天 04:17 + 登录时各一次）：
+
+```sh
+tools/qianfan-cookie-install.sh                             # 安装/更新
+launchctl kickstart -k gui/$(id -u)/io.dsh.qianfan-cookie   # 手动触发
+tail /tmp/dsh-qianfan-refresh.out.log                       # 看结果
+```
+
+两条安全性质，都有测试覆盖：
+
+| 性质 | 为什么重要 |
+|---|---|
+| 写前必探真实接口 | Chrome 会话过期时只返回 302；若照写会把可用凭据换成坏的，卡片从此只报登录失败 |
+| 值未变则不写文件 | 凭据库监听文件变化；每晚无谓重写会让所有消费者重新加载 |
+
+任务从 `~/.dsh/tools/` 运行而不是仓库目录：macOS TCC 不允许后台代理读 `~/Documents`，实测任务读自己的脚本会以 **126** 退出（`Operation not permitted`）；且 launchd 的 PATH 里没有 node（本机只有 DSH 自带的 `~/.local/bin/node`），缺失时是 127。仓库那份是源，`install.sh` 负责同步。
+
+### 为什么提取器不是手写名单
+
+第一版按名字列了 `BDUSS`、`bce-passport-stoken` 等 17 项，`verify` 仍然返回 302。原因是控制台实际认证用的是 `.bce.baidu.com` 域下的 `bce-session`、`bce-long-term-sessionid`，以及精确域名上的 `JSESSIONID`——名单里没有这些。
+
+现在改为完全复刻浏览器的选择规则：按域后缀（含点/不含点两种语义）、路径前缀、`Secure`、过期时间（`expires_utc` 为 0 表示会话 Cookie）筛选，同名时更长的路径优先。发往 `console.bce.baidu.com` 的真实集合是 **39–40 个 Cookie**，不是 17 个。
+
+这条规则有测试覆盖：会拒绝 v20 加密格式、空值、别的域的 Cookie，也会在 `saveRef` 里正确转义引号（Cookie 内含 `"`，不转义会让整份 YAML 解析失败、连带毁掉其他凭据）。
+
+### 第二组：本机计量（这台机器实际计费掉的 token）
+
+适配器每发一次 `usage` 事件，宿主就把它折进套餐自己的三个窗口：
+
+| 窗口 | 长度 | 官方现状 |
+|---|---|---|
+| 5 小时 | 5h 滚动 | 积分制限制当前限时取消，仍统计 |
+| 本周 | 7d 滚动 | 同上 |
+| 本月 | 30d 滚动 | 生效 |
+
+计量口径按 Token 制算：`inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens`。千帆 Token 制「不区分输入、输出及缓存 Token」，所以缓存命中部分也要计入——这和 harness 内部互斥三元组的语义不同，两者不能混用。
+
+**它的意义是兜底与对照**：没有 Cookie 时它是唯一能看的数字；有 Cookie 时它告诉你这个订阅里有多少是本机花的。它**不等于**官方已用量，因为控制台统计所有客户端。卡片上写的是「本机计量」，不是「已用」。
+
+### 路由
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/qianfan-usage/usage` | 官方读数（60s 缓存）+ 本机计量 |
+| GET | `/qianfan-usage/usage?force=1` | 绕过缓存 |
+| GET | `/qianfan-usage/cookie` | 是否已配置（从不回传值） |
+| POST | `/qianfan-usage/cookie` | `{ cookie }` → 探测后写入 |
+| DELETE | `/qianfan-usage/cookie` | 清除 |
+
+两条路由都过宿主自己的 `connection.requestRejection` / `admit` 门禁，只有本机已登录页面能读。
+
+### 降级行为
+
+| 状态 | 卡片表现 |
+|---|---|
+| 没有 Cookie | 摘要写「未配置控制台 Cookie」，本机计量照常显示 |
+| Cookie 过期 | 摘要写登录过期，本机计量照常显示 |
+| 无有效套餐 | `no-plan`，不把过期套餐的 100% 读成「用光了」 |
+| 上游超时/网络失败 | 报错文案区分 timeout 与 network，本机计量照常显示 |
+
+设计原则：**官方半边的失败不拖垮本机半边**。额度行不消失、不显示假的 0%。
+
+### 验证
+
+`npm test` 覆盖 57 项：Cookie 形状、时间戳时区、两种计费模式、过期/已释放套餐、重定向归类、窗口算术、路由门禁与写入拒绝、客户端渲染状态、以及 `apply()` 是否真的把两条路由挂上。
+
+未验证的部分：真实付费账号的控制台响应（离线用官方前端字段名构造）、以及浏览器里的实际绘制。

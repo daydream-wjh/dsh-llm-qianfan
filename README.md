@@ -118,6 +118,67 @@ Two empty-completion causes are deliberately separated. Measured on one request 
 
 Discovery sends the stored key only when the request carries its own `apiKey`, or when it asks about this provider's own route — a foreign `baseURL` never receives a paid credential.
 
+## Usage readout
+
+One row above the composer; expanding it shows two groups of numbers. **They come from different places and cannot substitute for each other.**
+
+### Plan quota (the console's own numbers, needs a console Cookie)
+
+Only the Baidu Cloud console answers "how much of the plan is left":
+
+```
+GET https://console.bce.baidu.com/api/qianfan/charge/tokenPlanPersonal/resource
+```
+
+**The inference API key cannot read the quota** — that is the server's shape, not a gap in this plugin: the key is answered with a 302 to the login page, and every `/v2/tokenplan/personal/{usage,quota,plan,balance,credits,…}` path returns 404. The console endpoint authenticates with the logged-in console.bce.baidu.com Cookie.
+
+### Automatic refresh (launchd)
+
+The Cookie is a browser session and it expires. A launchd job runs daily at 04:17, plus once at login:
+
+```sh
+tools/qianfan-cookie-install.sh   # install/update (re-run after changing the script)
+launchctl kickstart -k gui/$(id -u)/io.dsh.qianfan-cookie   # trigger once now
+tail /tmp/dsh-qianfan-refresh.out.log                       # see the result
+```
+
+Two properties make it safe: **verify before write** (a lapsed browser session can never replace a working credential), and **no write when unchanged** (a healthy day leaves the file alone, so the credentials store does not reload).
+
+It runs from `~/.dsh/tools/`, not the repo: macOS TCC forbids background agents from reading `~/Documents`, and a job that cannot read its own script exits 126. The repository copy is the source; `install.sh` syncs it.
+
+Paste it in the "Qianfan Token Plan" settings page, **via Copy as cURL**: sign in to the console and open "我的订阅" → DevTools Network → reload → pick the `tokenPlanPersonal/resource` request → right-click "Copy as cURL" → paste the whole command.
+
+Why not just copy the Cookie value: the session ticket `BDUSS` is **HttpOnly**. `document.cookie` returns 34 cookies for the domain and none of them is `BDUSS`; neither the DevTools Application panel's value cell nor any page-side view of a request header carries it. Sending that whole non-HttpOnly set to the quota endpoint still answers `302` to the login page (measured). "Copy as cURL" is the one gesture in the browser that includes it, so the plugin accepts the command verbatim and extracts the `Cookie` header itself.
+
+### Automatic extraction (macOS, needs a one-time grant)
+
+The Cookie is a browser session and it expires. Besides pasting Copy as cURL in the settings page, a script can read it straight from Chrome's encrypted store:
+
+```sh
+tools/qianfan-refresh.sh            # extract, verify, save
+tools/qianfan-refresh.sh --dry-run  # verify only
+```
+
+macOS guards Chrome's cookie database behind **Full Disk Access**: without it, `cp`, a Finder-mediated copy, and a copy run from inside Terminal.app all fail with `Operation not permitted`; with it, one run succeeds. Grant it under System Settings → Privacy & Security → Full Disk Access to the app that runs DSH, then restart DSH.
+
+The script always probes the real endpoint before writing, so re-running it whenever the session expires is safe — it will not replace a working credential with a broken one. A cron entry works too.
+
+It is stored as the `BAIDU_QIANFAN_COOKIE` credential, and the environment variable of that name works too. A save probes first: an expired login, or a header without `BDUSS`, is not written — otherwise the card would say "configured" beside a credential that always fails.
+
+### Local meter (what this machine actually billed)
+
+Every `usage` event the adapter emits is folded into the plan's own windows: 5 hours / this week / this month, counted the Token-mode way (input + output + cache — Qianfan does not separate cached tokens).
+
+Its value is the fallback: with no Cookie it is the only number available; with one it says how much of the subscription this machine spent. It is **not** the console's used total, because the console counts every client.
+
+| State | Card |
+| --- | --- |
+| No Cookie | says so; the local meter still renders |
+| Cookie expired | says the login expired; the local meter still renders |
+| No active plan | a lapsed plan is not dressed up as a spent one |
+
+A failure on the official half never takes the local half down: the row does not disappear and never shows a fake zero.
+
 ## Known limits
 
 - Reasoning tokens are billed against `max_tokens`, so a small cap can be consumed entirely by thinking and return empty visible text. The plugin materializes `32768` when a caller omits `maxTokens`.
@@ -130,7 +191,10 @@ The adapter is duck-typed rather than extending `LlmAdapter`, so the package car
 
 ```sh
 node --input-type=module -e "await import('./index.js')"   # syntax check
+npm test                                                   # 57 offline checks
 ```
+
+Four suites under `verify/`: `usage-meter.test.mjs` (Cookie shape, time zone, both billing modes, window arithmetic), `route.test.mjs` (route contract and gate), `client.test.mjs` (render states), `apply.test.mjs` (`apply()` really registers the routes, and one real stream reaches the meter).
 
 ## License
 

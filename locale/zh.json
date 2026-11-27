@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "百度千帆 Token Plan 通道",
-    "description": "接入百度千帆 Token Plan 个人版专属网关（OpenAI 兼容），提供 qianfan 模型路由，支持流式文本、深度思考、工具调用与用量统计。",
+    "description": "接入百度千帆 Token Plan 个人版专属网关（OpenAI 兼容），提供 qianfan 模型路由，支持流式文本、深度思考、工具调用与用量统计；composer 上方显示套餐额度（控制台口径）与本机 token 计量。",
     "detail": "docs/DETAIL.md"
   }
 }
