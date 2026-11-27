@@ -7,7 +7,7 @@
 - 走千帆 Token Plan 专属的 OpenAI 兼容 `chat/completions` 接口，支持流式返回
 - 转发深度思考内容（`reasoning_content` → harness 的 `reasoning` 块），并由 `thinking` 开关控制
 - 转发工具调用（`tool_calls` ↔ harness 的 `tool-call` 块），千帆侧已验证 `finish_reason: tool_calls`
-- 回报用量（`prompt_tokens_details.cached_tokens` 亦在响应里，暂只取总量）
+- 回报用量：`prompt_tokens` 折算成 harness 的互斥三元组——`prompt_tokens_details.cached_tokens` 拆出去当 `cacheReadTokens`，剩余的当 `inputTokens`；千帆的 `prompt_tokens` 是含缓存的全量，直接透传会导致缓存命中率恒为 0
 - 在模型页登记 Token Plan 个人版当前开放的 chat 模型
 
 ## 模型清单（2026-11-27 由 `/v2/tokenplan/personal/models` 实测拉取）

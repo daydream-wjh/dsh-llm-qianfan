@@ -567,13 +567,28 @@ function createAdapter(configOf) {
         const prompt = Number(usage.prompt_tokens ?? 0)
         const completion = Number(usage.completion_tokens ?? 0)
         const reasoningTokens = Number(usage.completion_tokens_details?.reasoning_tokens ?? 0)
+        // Qianfan reports `prompt_tokens` as the WHOLE prompt and breaks the
+        // cached share out separately. The harness vocabulary is disjoint:
+        // `inputTokens` means uncached input only, and `cacheReadTokens` /
+        // `cacheWriteTokens` are added on top of it. Passing `prompt_tokens`
+        // straight through therefore double-counts the cached prefix — the UI
+        // then divides cache reads by a prompt that already contains them and
+        // the session reports a permanently cold cache. Subtract instead.
+        const cacheRead = Number(
+          usage.prompt_tokens_details?.cached_tokens
+            ?? usage.prompt_cache_hit_tokens
+            ?? usage.cached_tokens
+            ?? 0,
+        )
+        const inputTokens = Math.max(0, prompt - cacheRead)
         yield {
           type: 'usage',
           usage: {
-            inputTokens: prompt,
+            inputTokens,
             outputTokens: completion,
             totalTokens: Number(usage.total_tokens ?? prompt + completion),
             ...reasoningTokens > 0 ? { reasoningTokens } : {},
+            ...cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
           },
         }
       }
