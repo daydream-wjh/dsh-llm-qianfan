@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Qianfan Token Plan provider",
+    "description": "Adds a qianfan model route backed by Baidu Qianfan's Token Plan OpenAI-compatible gateway, with streaming text, reasoning, tool calls, and token usage.",
+    "detail": "docs/DETAIL.md"
+  }
+}

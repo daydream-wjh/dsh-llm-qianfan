@@ -1,0 +1,47 @@
+{
+  "name": "dsh-llm-qianfan",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Baidu Qianfan Token Plan provider route for the DeepSeek Harness LLM seam: adds a qianfan model route with streaming text, reasoning, tool calls and per-model reasoning-effort ladders.",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "qianfan",
+    "baidu",
+    "llm",
+    "provider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daydream-wjh/dsh-llm-qianfan.git"
+  },
+  "homepage": "https://github.com/daydream-wjh/dsh-llm-qianfan#readme",
+  "bugs": {
+    "url": "https://github.com/daydream-wjh/dsh-llm-qianfan/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

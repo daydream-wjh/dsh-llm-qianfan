@@ -1,0 +1,14 @@
+# Baidu Qianfan Token Plan provider route for the DeepSeek Harness LLM seam.
+# The API key is resolved at request time from, in order: this row's apiKey,
+# the QIANFAN_API_KEY environment variable, then refs.QIANFAN_API_KEY in
+# $DSH_HOME/.credentials.yaml. Leave apiKey empty to use the stored credential.
+#
+# The base URL is the Token Plan personal gateway, not the general /v2 endpoint:
+# a Token Plan key against /v2 fails with token_plan_person_api_key_not_allowed,
+# and a general-purpose key against /v2/tokenplan/personal fails the same way.
+- insert:
+    - id: llm-qianfan
+      name: 'dsh-llm-qianfan'
+      config:
+        apiKey: ''
+        baseURL: 'https://qianfan.baidubce.com/v2/tokenplan/personal'

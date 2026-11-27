@@ -1,0 +1,122 @@
+# dsh-llm-qianfan
+
+Baidu Qianfan **Token Plan** provider route for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) LLM seam. Registers a `qianfan` provider that speaks Qianfan's OpenAI-compatible `chat/completions` API, with streaming text, reasoning blocks, tool calls and token usage.
+
+> 中文说明见 [README.zh.md](./README.zh.md)。
+
+## Why the Token Plan endpoint is hard-coded
+
+A Token Plan personal key and a pay-as-you-go key are not interchangeable. A Token Plan key against the general `/v2` endpoint fails with `401 token_plan_person_api_key_not_allowed`, and a general key against the Token Plan endpoint fails the same way. The two must travel together, so this plugin pins the base URL to the Token Plan gateway instead of making it a free-form field:
+
+| Credential | Only working base URL |
+| --- | --- |
+| Token Plan personal (`bce-v3/ALTAK...`) | `https://qianfan.baidubce.com/v2/tokenplan/personal` |
+| Pay-as-you-go | `https://qianfan.baidubce.com/v2` |
+
+The row config still accepts `baseURL` to override this, for a future gateway rename or an enterprise seat.
+
+## Models
+
+The Token Plan gateway serves a narrow allowlist. Any model outside it returns `403 token_plan_person_model_not_supported` regardless of key validity, so the catalog only lists models the gateway actually accepts.
+
+| Model id | Context | Max output | Images |
+| --- | --- | --- | --- |
+| `deepseek-v4.1-flash` | 1,441,792 | 393,216 | yes |
+| `deepseek-v4.1-flash-1017` | 1,441,792 | 393,216 | yes |
+| `deepseek-v4-pro` | 1,441,792 | 393,216 | no |
+| `deepseek-v4-pro-0813` | 1,441,792 | 393,216 | no |
+| `deepseek-v4-flash-0731` | 1,441,792 | 393,216 | no |
+| `glm-5.3` | 1,179,648 | 131,072 | no |
+| `glm-5.3-flash` | 1,179,648 | 131,072 | yes |
+| `glm-5.2` | 1,179,648 | 131,072 | no |
+| `glm-5.1` | 333,824 | 131,072 | no |
+| `ernie-5.5-flash-preview` | 2,097,152 | 1,048,576 | no |
+| `ernie-light-dt-1.0` | 1,179,648 | 131,072 | no |
+
+The context and max-output numbers come from Qianfan's public `/v2/models` metadata. The Token Plan `/models` endpoint returns only `id`, `object` and `owned_by`, so it carries no sizing information.
+
+## Reasoning effort is per model, not global
+
+`reasoning_effort` is one field name, but each model family publishes its own ladder. The gateway performs a single loose check and reports its accepted set in the 400 message:
+
+```
+parameter check failed, reasoning_effort must be none or low or medium or high or xhigh or max
+```
+
+That is the transport envelope. The real ladders are narrower and come from each vendor's documentation:
+
+| Model | Ladder | Default |
+| --- | --- | --- |
+| DeepSeek V4.x (all five) | `low`, `high`, `max` | `high` |
+| `glm-5.3`, `glm-5.3-flash` | `low`, `high`, `max` | `max` |
+| `glm-5.2` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | `max` |
+| `glm-5.1` | none declared — an explicit effort is rejected | — |
+| `ernie-5.5-flash-preview` | `low`, `medium`, `high` | `high` |
+| `ernie-light-dt-1.0` | `low`, `high`, `max` | `max` |
+
+Sources, quoted in the code next to each constant:
+
+- DeepSeek — <https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/>: `{"reasoning_effort": "low/high/max"}`, effort defaults to `high`, thinking defaults to on. DeepSeek also documents a fold table (minimal→low, medium→high, xhigh→high, ultra→max); those folded values are **not** exposed here, because they do not error — they silently degrade.
+- Zhipu — <https://docs.bigmodel.cn/cn/guide/capabilities/thinking>: GLM-5.3 "only accepts max, high, low; other inputs will error", default `max`, thinking cannot be disabled. GLM-5.2 accepts all seven. `reasoning_effort` is scoped to "GLM-5.2 and above", so GLM-5.1 gets no ladder.
+- Qianfan — <https://cloud.baidu.com/doc/qianfan-docs/s/Wm95lyynv>: ERNIE-5.5-Flash-Preview defaults to `high` with range `low`/`medium`/`high`; ERNIE-Light-DT-1.0 defaults to `max` with range `low`/`high`/`max`.
+
+`glm-5.1` declaring an empty ladder is deliberate: the DSH seam then refuses an explicit `reasoningEffort` for that model instead of forwarding an invented value.
+
+## Thinking switch is a separate axis
+
+`thinking.type` (`enabled`/`disabled`) controls whether a reasoning pass happens at all; `reasoning_effort` controls how deep it runs. Conflating the two drops reasoning from models that default to on.
+
+`glm-5.3` and `glm-5.3-flash` use forced thinking. Zhipu's documentation says sending `disabled` errors out, but this gateway silently ignores the field instead — so the request omits `thinking` for those two models rather than letting the caller believe reasoning was switched off.
+
+DeepSeek's reasoning models ignore `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `logprobs` and `top_logprobs`: setting them does not error and does not take effect.
+
+## Credential resolution
+
+Checked in order, first non-empty wins:
+
+1. this plugin row's `apiKey`
+2. the `QIANFAN_API_KEY` environment variable
+3. `refs.QIANFAN_API_KEY` in `$DSH_HOME/.credentials.yaml`
+
+The default is the third, so the key does not have to live in a profile config file.
+
+## Install
+
+```sh
+dsh plugin --profile <name> add github:daydream-wjh/dsh-llm-qianfan
+```
+
+Then store the key once:
+
+```sh
+# in $DSH_HOME/.credentials.yaml, under refs:
+QIANFAN_API_KEY: 'bce-v3/ALTAK...'
+```
+
+To make it the default model, edit the profile's `cordis.patch.yml`:
+
+```yaml
+- id: agent-default-model
+  config:
+    provider: qianfan
+    model: deepseek-v4.1-flash
+    reasoningEffort: high   # DeepSeek's documented default
+```
+
+## Known limits
+
+- Reasoning tokens are billed against `max_tokens`, so a small cap can be consumed entirely by thinking and return empty visible text. The plugin materializes `32768` when a caller omits `maxTokens`.
+- `thinking_budget` appears in Qianfan's documentation for DeepSeek thinking models (32k chain-of-thought), but measurements across `100`/`500`/`32768` did not separate from sample noise, so this plugin does not send it.
+- Model metadata is a static catalog. The Token Plan `/models` endpoint returns no capability data, so a newly launched model does not appear until the catalog is updated.
+
+## Development
+
+The adapter is duck-typed rather than extending `LlmAdapter`, so the package carries no dependency on `@deepseek-ai/dsh-llm` and resolves from a linked profile directory.
+
+```sh
+node --input-type=module -e "await import('./index.js')"   # syntax check
+```
+
+## License
+
+MIT
